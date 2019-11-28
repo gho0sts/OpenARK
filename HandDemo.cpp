@@ -1,4 +1,16 @@
-#include "stdafx.h"
+#include <ctime>
+#include <cstdlib>
+#include <cstdio>
+#include <string>
+#include <vector>
+#include <memory>
+#include <algorithm>
+#include <Eigen/Dense>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
 
 // OpenARK Libraries
 #include "Version.h"
@@ -11,10 +23,13 @@
 #ifdef RSSDK2_ENABLED
     #include "RS2Camera.h"
 #endif
+#ifdef AZURE_KINECT_ENABLED
+    #include "AzureKinectCamera.h"
+#endif
 
 #include "Core.h"
 #include "Visualizer.h"
-#include "StreamingAverager.h"
+#include "Util.h"
 
 using namespace ark;
 
@@ -31,7 +46,9 @@ int main() {
     // initialize the camera
     DepthCamera::Ptr camera;
 
-#if defined(RSSDK2_ENABLED)
+#if defined(AZURE_KINECT_ENABLED)
+    camera = std::make_shared<AzureKinectCamera>();
+#elif defined(RSSDK2_ENABLED)
     camera = std::make_shared<RS2Camera>();
 #elif defined(RSSDK_ENABLED)
     ASSERT(strcmp(OPENARK_CAMERA_TYPE, "sr300") == 0, "Unsupported RealSense camera type.");

@@ -1,8 +1,14 @@
 #pragma once
 #include <opencv2/core.hpp>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/common/transforms.h>
+#include <boost/smart_ptr.hpp>
+#include <Eigen/Dense>
 #include <vector>
 #include <string>
 #include "Version.h"
+#include <librealsense2/rs.hpp>
 
 namespace ark {
     /**
@@ -292,14 +298,14 @@ namespace ark {
          * @param [in] xyz_map the input point cloud
          * @param seed seed point
          * @param thresh maximum euclidean distance allowed between neighbors
-         * @param [out] output_ij_points optionally, pointer to a vector for storing ij coords of the points in the component.
-         * @param [out] output_xyz_points optionally, pointer to a vector for storing xyz coords of the points in the component.
-         * @param [out] output_mask optional output matrix for storing points visited by the floodfill (set to NULL to disable)
-
-         * @param interval1 interval to adjacent points (e.g. if 2, adjacent points are (-2, 0), (0, 2), etc.)
-         * @param interval2 additional interval to adjacent points (0 = not used), only works for up/down fill
-         * @param interval2_thresh distance theshold for interval2
-         * @param [in, out] color an auxiliary matrix (CV_8U)
+         * @param [out] output_ij_points optionally, pointer to a vector for storing 2D coords of the points visited by flood fill
+         * @param [out] output_xyz_points optionally, pointer to a vector for storing 3D coords of the points visited by flood fill
+         * @param [out] output_mask optional output image of same type as xyz_map where all pixels visited by
+         *                          the floodfill are copied from xyz_map and other pixels are set to black (set to NULL to disable)
+         * @param interval1 distance in pixels to neighbors on the image (e.g. if 2, neighbors are (-2, 0), (0, 2), etc.); default 1
+         * @param interval2 (advanced) optional additional interval (0 = not used), only works for up/down fill
+         * @param interval2_thresh (advanced) optionally, the distance theshold for interval2 replacing thresh
+         * @param [in, out] visited_map (advanced) an auxiliary matrix (CV_8U)
          *             for recording if a point is being visited (1), has already been visited (0)
          *             or is not yet visited (255)
          *             By default, allocates a temporary matrix for use during flood fill.
@@ -312,7 +318,7 @@ namespace ark {
             std::vector <Vec3f> * output_xyz_points = nullptr,
             cv::Mat * output_mask = nullptr,
             int interval1 = 1, int interval2 = 0, float interval2_dist = 0.05f, 
-            cv::Mat * color = nullptr, bool cosine = false);
+            cv::Mat * visited_map = nullptr, bool cosine = false);
 
         /**
         * Compute the angle in radians 'pointij' is at from the origin, going CCW starting from (0, 1), if y-axis is facing up.
@@ -591,6 +597,9 @@ namespace ark {
                              double angle, double angle_offset = 0.0);
 
 
+        /** try to find the correct path relative to the current directory, given path from root (dir with data, config) */
+        std::string resolveRootPath(const std::string & root_path);
+
         /** Converts an Eigen Vector3d to a PCL PointXYZRGBA instance, using r.g,b,a values specified if applicable */
         pcl::PointXYZRGBA toPCLPoint(const Eigen::Vector3d & v, int r = 200, int g = 200, int b = 200, int a = 200);
 
@@ -620,15 +629,17 @@ namespace ark {
 
         /** Converts an xyz_map into a PCL point cloud
          * @param flip_z if true, inverts the z coordinate of each point
+         * @param flip_y if true, inverts the y coordinate of each point
+         * @param step only converts pixels at the given interval (default is every pixel0
          */
         template<class T>
         boost::shared_ptr<pcl::PointCloud<T> > toPointCloud(const cv::Mat & xyz_map, 
-            bool flip_z = false, bool flip_y = false) {
+            bool flip_z = false, bool flip_y = false, int step = 1) {
             auto out_pc = boost::make_shared<pcl::PointCloud<T> >();
             const Vec3f * ptr;
-            for (int i = 0; i < xyz_map.rows; ++i) {
+            for (int i = 0; i < xyz_map.rows; i += step) {
                 ptr = xyz_map.ptr<Vec3f>(i);
-                for (int j = 0; j < xyz_map.cols; ++j) {
+                for (int j = 0; j < xyz_map.cols; j += step) {
                     if (ptr[j][2] > 0.001) {
                         T pt;
                         pt.x = ptr[j][0];
@@ -643,19 +654,18 @@ namespace ark {
             return out_pc;
         }
 
-		/** Converts an xyz_map into a PCL point cloud of PointXYZ
-		* @param flip_z if true, inverts the z coordinate of each point
-		*/
-		void toPointCloud(const cv::Mat & xyz_map, pcl::PointCloud<pcl::PointXYZ>::Ptr & out_pc,
-			bool flip_z = false, bool flip_y = false);
-
-        /** Rotate a 3D vector by a quaternion. ( */
+        /** Rotate a 3D vector by a quaternion. */
         template<class T, class Quat_T> inline
             Eigen::Matrix<T, 3, 1> rotate(const Eigen::Matrix<T, 3, 1> & v, const Quat_T & q) {
-            const Eigen::Matrix<T, 3, 1> & u = q.vec().cast<T>();
+            const Eigen::Matrix<T, 3, 1> & u = q.vec().template cast<T>();
             const T w = T(q.w()), two(2);
             return two * u.dot(v) * u + (w * w - u.dot(u)) * v + two * w * u.cross(v);
         }
+
+        /** Estimate pinhole camera intrinsics from xyz_map (by solving OLS)
+         *  @return (fx, cx, fy, cy)
+         */
+        cv::Vec4d getCameraIntrinFromXYZ(const cv::Mat & xyz_map);
 
         /**
          * Compares two points (Point, Point2f, Vec3i or Vec3f),
@@ -672,5 +682,95 @@ namespace ark {
         private:
             bool reverse = false, compare_y_then_x = false;
         };
+
+        // The following functions are adapted from https://github.com/sxyu/FMM
+        /* Pixel weight functions for segmentation */
+        namespace weight {
+            /** Weight map types */
+            enum WeightMap {
+                /** No weight map -- keep input image as is */
+                IDENTITY = 0,
+                /** Gradient magnitude */
+                GRADIENT,
+                /** Absolute intensity difference from seeds */
+                ABSDIFF,
+                /** Laplacian absolute value */
+                LAPLACIAN
+            };
+
+            /** Compute absolute grayscale intensity difference pixel weights.
+              * Parts of the image that are more different from the seed pixels will have higher
+              * weight. This is similar to Matlab's graydiffweight().
+              * This version only supports CV_32F Mat's.
+              * @param image input image
+              * @param seeds vector of seed points. The mean intensities at these points will be
+              *              the reference intensity.
+              */
+            cv::Mat difference_weights(const cv::Mat& image, const std::vector<cv::Point>& seeds);
+
+            /** Compute Sobel gradient magnitudepixel weights. Parts of the image that vary more
+              * quickly will have higher weight
+              * This is similar to Matlab's graydientweight()
+              * @param image input image
+              * @param normalize_output whether to min-max normalize output image to 0-1 range
+              * @param ksize Sobel kernel size, passed to cv::Sobel
+              */
+            cv::Mat gradient_weights(const cv::Mat & image, bool normalize_output = false, int ksize = 3);
+
+            /** Compute image Laplacian-based pixel weights
+              * @param image input image
+              * @param normalize_output whether to min-max normalize output image to 0-1 range
+              * @param ksize Laplacian kernel size, passed to cv::Laplacian
+              */
+            cv::Mat laplacian_weights(const cv::Mat& image, bool normalize_output = false, int ksize = 1);
+        }
+
+        /** Performs Sethian's Fast Marching Method on image from the given starting pixels
+          * Similar to Matlab's imsegfmm() function.
+          * @param image input image. Should be of type CV_32F.
+          * @param seeds vector of seed points to start FMM from
+          * @param weight_map_type Weight map to apply to input image before starting FMM. By default,
+          *                        no weight map is applied.
+          * @param segmentation_threshold: if specified, sets pixels with geodesic value less
+          *                                than or equal to this threshold to 1 and others to 0
+          *                                in the output image. If not given,the geodesic
+          *                                distances map will be returned.
+          * @param normalize_output_geodesic_distances: if true, normalizes geodesic distances
+          *                                             values to be in the interval [0, 1].
+          *                                             If segmentation_threshold is specified,
+          *                                             this occurs prior to segmentation.
+          *                                             Default true.
+          *  @param output: optionally, an already-allocated OpenCV Mat.
+          *                 This allows you to avoid a copy if you already have one
+          *                 allocated (that means a Mat with size, not empty). By
+          *                 default a new image is created, and this is not necessary.
+          */
+        cv::Mat fmm(const cv::Mat& image,
+            const std::vector<cv::Point>& seeds,
+            weight::WeightMap weight_map_type = weight::IDENTITY,
+            float segmentation_threshold = std::numeric_limits<float>::max(),
+            bool normalize_output_geodesic_distances = true,
+            cv::Mat output = cv::Mat());
     };
 }
+
+namespace boost
+{
+namespace serialization
+{
+
+template <class Archive>
+void serialize(Archive &ar, rs2_intrinsics &i, const unsigned int version)
+{
+    ar &i.width;
+    ar &i.height;
+    ar &i.ppx;
+    ar &i.ppy;
+    ar &i.fx;
+    ar &i.fy;
+    ar &i.model;
+    ar &i.coeffs;
+}
+
+} // namespace serialization
+} // namespace boost 

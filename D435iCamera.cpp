@@ -123,7 +123,7 @@ namespace ark {
 
         try {
             // Ensure the frame has space for all images
-            frame.images_.resize(4);
+            frame.images_.resize(5);
 
             // Get frames from camera
             auto frames = pipe->wait_for_frames();
@@ -156,6 +156,9 @@ namespace ark {
             if (frame.images_[3].empty()) frame.images_[3] = cv::Mat(cv::Size(width,height), CV_8UC3);
             std::memcpy( frame.images_[3].data, color.get_data(),3 * width * height);
 
+            if (frame.images_[4].empty()) frame.images_[4] = cv::Mat(cv::Size(width,height), CV_16UC1);
+            // 16 bits = 2 bytes
+            std::memcpy(frame.images_[4].data, depth.get_data(),width * height * 2);
 
         } catch (std::runtime_error e) {
             // Try reconnecting
@@ -194,10 +197,16 @@ namespace ark {
                 }
                 srcPixel[0] = c;
                 rs2_deproject_pixel_to_point(destXYZ, dIntrin, srcPixel, srcPtr[c]);
-                //std::cout<< destXYZ[0] << destXYZ[1] << destXYZ[2] <<std::endl;
                 memcpy(&destPtr[c], destXYZ, 3 * sizeof(float));
             }
         }
     }
 
+    const rs2_intrinsics &D435iCamera::getDepthIntrinsics() {
+        return depthIntrinsics;
+    }
+
+    double D435iCamera::getDepthScale() {
+        return scale;
+    }
 }
